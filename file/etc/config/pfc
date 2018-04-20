@@ -1,0 +1,33 @@
+
+
+config global 'global'
+	option 
+	option current_mark '0x1002'
+
+config down_net 'eth2'
+        option enable '1'
+        option interface 'br-lan2'
+	option up_burst_bw '20m'
+	option up_bw '20m'
+	option down_bw '8m'
+	option down_burst_bw '8m'
+
+
+config down_net 'eth3'
+	option enable '1'
+        option interface 'br-lan3'
+        option up_burst_bw '30m'         
+        option up_bw '30m'  
+	option down_bw '4m'
+	option down_burst_bw '4m'
+	         
+
+config up_net 'wan' 
+        option enable '1'
+        option interface 'eth1'
+        option total_up_bw '50m'
+        option total_down_bw '50m'
+
+
+
+

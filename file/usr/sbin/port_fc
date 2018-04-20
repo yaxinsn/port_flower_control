@@ -1,0 +1,350 @@
+#!/bin/sh
+
+. /lib/functions.sh
+
+LOG=/tmp/port_fc.log
+RUNDIR="/var/run/port_fc/"
+
+TC_STATE="/var/run/port_fc/tc_state"
+TC_STATE_BAK="/var/run/port_fc/tc_state-bak"
+IPT_STATE="/var/run/port_fc/ipt_state"
+IPT_STATE_BAK="/var/run/port_fc/ipt_state-bak"
+TC="/usr/sbin/tc"
+
+IPT="ipt_cmd_run"
+
+DW_CHAIN="QOSMARK_DOWN_NET"
+USER_CHAIN="QOSMARK_USER"
+
+ACTION="${1:-start}"
+
+
+BASE_MARK=0x100;
+
+config_load pfc
+
+export UP_IFACE=$(config_get wan interface)
+export UP_BW=$(config_get wan total_up_bw)
+
+sqm_cmd_log() {
+	printf "`date` | cmd: $@ \n" >>$LOG
+}
+sqm_log() {
+	printf "`date` | $@  \n" >> $LOG
+}
+	
+ipt_cmd_run() {
+
+	local ipt="/usr/sbin/iptables"
+
+	eval $ipt $@;
+	if [ "$?" = "0" ];then
+		echo $@ >>$IPT_STATE;
+		true;
+	fi
+	false;
+}
+
+DOWN_CFG=$(cat /etc/config/pfc | grep config | grep down_net | awk '{print $3}')
+                      
+
+calc_rate() {
+	local unit=`echo $1 | cut -b ${#1}`
+	local value=0
+
+	case "$unit" in
+        	k|K)
+                	base=1000;
+                	value=`echo $1 | cut -b 0-$((${#1}-1))`
+        	;;
+        	m|M)
+                	base=1000000;
+                	value=`echo $1 | cut -b 0-$((${#1}-1))`
+        	;;
+        	*)
+                	base=1
+        	        value=$1
+	        ;;
+
+	esac
+
+	local ret=$(($value*$base))
+	echo $ret;
+
+}
+
+reverse_file(){
+	awk '{array[NR]=$0} END { for(i=NR;i>0;i--){print array[i];} }' $1 >$2
+}
+
+
+get_dev_ifindex() {
+
+	local index=$(cat /sys/class/net/$1/ifindex)
+	if [ "$?" = "1" ];then
+		echo "";
+		return;		#error;
+	fi
+	echo $index;
+}
+#####################ipt function ########################
+ipt_clean_as_state(){
+	if [ -e "$IPT_STATE" ];then
+	    sqm_log "clean iptables rule as $IPT_STATE"
+	    rm /tmp/.ipt_state;
+	    reverse_file $IPT_STATE /tmp/.ipt_state
+	    while read LINE
+            do
+                sqm_log "orgion cmd:$LINE "
+		local clean_cmd="";
+		ipt_cmd=$(echo $LINE | awk '{print $3}')
+		
+		case $ipt_cmd in
+			-A)
+				new_ipt_cmd="-D"
+			;;
+			-I)
+				new_ipt_cmd="-D"
+			;;
+			-N)
+				new_ipt_cmd="-X"
+			;;
+			-C|-D)
+				new_ipt_cmd="-C"
+			;;
+			*)
+				new_ipt_cmd="-C"
+			;;
+		esac
+                clean_cmd=$(echo $LINE |  awk '{for(i=1;i<=2;i=i+1) printf $i" "}')                                                                                                                                         
+                clean_cmd=${clean_cmd}" "$new_ipt_cmd                                                                                                                                                                       
+                clean_cmd=${clean_cmd}" "$(echo $LINE |  awk '{for(i=4;i<=NF+1;i=i+1) printf $i" "}') 
+                sqm_log "run cmd : $clean_cmd "
+		iptables $clean_cmd;
+		
+            done  < /tmp/.ipt_state
+	fi
+}
+ipt_clean(){
+
+
+local ipt="/usr/sbin/iptables"
+	if [ -e "$IPT_STATE" ];then
+		ipt_clean_as_state;
+		mv $IPT_STATE $IPT_STATE_BAK
+	fi
+###redundancy code
+	$ipt -t mangle -F ${DW_CHAIN}
+	$ipt -t mangle -F ${USER_CHAIN}
+
+	$ipt -t mangle -D PREROUTING -j ${DW_CHAIN}	
+	$ipt -t mangle -D PREROUTING -j ${USER_CHAIN}	
+
+	$ipt -t mangle -X ${DW_CHAIN}
+	$ipt -t mangle -X ${USER_CHAIN}
+####invalid code
+
+}
+
+ipt_set_down_iface(){
+	local down_iface=$1
+	
+        local enable=$(config_get $down_iface enable);    
+        if [ "$enable" != "1" ]; then                             
+                sqm_log "this $down_iface config is disabled ,at ip_set_down_iface!";                                                 
+                return;                                                                                                               
+        fi  
+
+	#local mark=$(config_get $down_iface mark) 
+	local interface=$(config_get $down_iface interface)
+	local ifindex=$(get_dev_ifindex $interface)
+	if [ -z $ifindex ];then
+		sqm_log "dev $1 not exist at system"; 
+		return;
+	fi
+	mark=$(($(printf %d $BASE_MARK)+$ifindex))
+	if [ -z "$interface" ];then
+		sqm_log "ERROR: $down_iface not interface option " 
+		return -1;
+	fi
+	
+	$IPT -t mangle -C $DW_CHAIN -i $interface  -j MARK --set-mark $mark
+	[ "$?" = "1" ] && $IPT -t mangle -A $DW_CHAIN -i $interface  -j MARK --set-mark $mark
+
+}
+
+ipt_set(){                    
+	ipt_clean;
+
+        $IPT -t mangle -N ${USER_CHAIN}
+	$IPT -t mangle -C PREROUTING -j ${USER_CHAIN}	
+	[ "$?" = "1" ] && $IPT -t mangle -I PREROUTING -j ${USER_CHAIN}	
+	
+        $IPT -t mangle -N ${DW_CHAIN} 
+	$IPT -t mangle -C PREROUTING -j ${DW_CHAIN}	
+        [ "$?" = "1" ] && $IPT -t mangle -I PREROUTING -j ${DW_CHAIN} 
+	
+	for i in $DOWN_CFG; do
+		dev=`eval echo $i`
+		echo "down inface $dev"
+		ipt_set_down_iface $dev;
+	done
+	
+}
+#######################tc clean ##################################
+
+tc_clean_down_iface() {
+	local iface=$1
+	qdisc del dev $iface root                                         
+        sqm_log "tc clean wan: $TC qdisc del dev $iface root";
+}
+
+tc_clean_down_ifaces() {
+
+	for i in $DOWN_CFG; do                                                                                                       
+                local cfg=`eval echo $i`                                                                                                      
+		local iface=$(config_get $cfg interface)
+                tc_clean_down_iface $iface                                                                              
+        done  
+	
+}
+tc_clean_wan() {
+	$TC qdisc del dev $UP_IFACE root 
+	sqm_log "tc clean wan: $TC qdisc del dev $UP_IFACE root";
+}
+
+tc_main_clean(){
+
+	sqm_log "tc clean all ";
+
+	if [ -e $TC_STATE ];then 
+	    while read LINE
+            do
+        	$TC qdisc del dev $LINE root
+        	sqm_cmd_log "    $TC qdisc del dev $LINE root";
+            done  < $TC_STATE
+ 
+		mv $TC_STATE $TC_STATE_BAK
+	fi  
+ 	tc_clean_wan;                                                                               
+        tc_clean_down_ifaces; 
+}
+
+######################tc set ##############################
+tc_set_down_iface_down_bw() {
+	local down_iface=$1                                                                                                                                                                                                                 
+	local iface=$2                                                                                                                                                                                                                 
+
+	local burst_bw=$(config_get $down_iface down_burst_bw)                                                                          
+        local       bw=$(config_get $down_iface down_bw)                                                                                
+        bw=$(calc_rate $bw)                                                                                                           
+        local ceil_bw=$(calc_rate $burst_bw) 
+	
+### clear dev tc qdisc
+	$TC qdisc del dev $iface root;
+	echo $iface >>$TC_STATE 
+### add a htb qdisc	
+        sqm_log " down dev's down bw: $interface  downbw $bw down burst bw $burst_bw";                                        
+	$TC qdisc add dev $iface root handle 1: htb default 1	
+	$TC class add dev $iface parent 1:1 classid 1:1 htb rate ${bw}bit  ceil ${ceil_bw}bit
+	sqm_cmd_log "$TC class add dev $iface parent 1:1 classid 1:1 htb rate ${bw}bit  ceil ${ceil_bw}bit"
+}
+
+tc_set_down_iface_up_bw(){
+ 	local down_iface=$1                                                                                            
+        local classid=$2
+
+ 	local interface=$3                                                
+ 	local mark=$4 
+ #### set up down_interface's up bandwidth, at wan dev's qdisc.                                      
+        local burst_bw=$(config_get $down_iface up_burst_bw)                                                
+        local       bw=$(config_get $down_iface up_bw)                                                      
+        bw=$(calc_rate $bw)                                                                                 
+        local ceil_bw=$(calc_rate $burst_bw)                                                                                 
+                                                                                                                                      
+        sqm_log " down dev's up bw: $interface  $mark,classid $classid upbw $bw up burst bw $burst_bw";                                        
+                                                                                                                                        
+        $TC class add dev $UP_IFACE parent 1: classid 1:$classid htb rate ${bw}bit ceil ${ceil_bw}bit burst $(($bw/10))                 
+        sqm_cmd_log "  $TC class add dev $UP_IFACE parent 1: classid 1:$classid htb rate ${bw}bit ceil ${ceil_bw}bit burst $(($bw/10))"
+        $TC filter add dev $UP_IFACE parent 1: handle $mark fw classid 1:$classid                                                       
+        sqm_cmd_log "  $TC filter add dev $UP_IFACE parent 1: handle $mark fw classid 1:$classid"
+}
+
+tc_set_down_iface() {
+
+ local down_iface=$1                                                                                                           
+        local classid=$2                                                                                                              
+        local enable=$(config_get $down_iface enable);                                                                                
+        if [ "$enable" != "1" ]; then                                                                                                 
+                sqm_log "   this $down_iface config is disabled , at tc_set_down_iface!"                
+                return;                                                                                     
+        fi                                                                                                  
+                                                                                                            
+                                                                                                            
+        local interface=$(config_get $down_iface interface)                                                 
+        local ifindex=$(get_dev_ifindex $interface)                                                         
+        if [ -z $ifindex ];then                                                                             
+                sqm_log "   dev $down_iface not exist at system"                                                            
+                return;                                                                                                               
+        fi                                                                                                                              
+        local mark=$(($(printf %d $BASE_MARK)+$ifindex))  
+
+	tc_set_down_iface_up_bw $down_iface $classid $interface $mark
+	tc_set_down_iface_down_bw $down_iface $interface
+	sqm_log "down dev $interface cfg end\n"
+
+
+}
+tc_set_wan() {
+
+	local enable=$(config_get wan enable);
+	if [ "$enable" != "1" ]; then
+		sqm_log "wan config is disable !"
+		return;
+	fi
+	local up_bw=$(calc_rate $UP_BW) ;                                                                              
+        $TC qdisc add dev $UP_IFACE root handle 1: htb default 1                                                                
+	echo $UP_IFACE >>$TC_STATE 
+ #######default class rate is 10% to total bw.                                                             
+        $TC class add dev $UP_IFACE parent 1:1 classid 1:1 htb rate $(($up_bw/10))bit  ceil $(($up_bw/5))bit
+	sqm_log "set wan port default bandwidth 10% of total up bw!"
+        sqm_cmd_log "$TC class add dev $UP_IFACE parent 1:1 classid 1:1 htb rate $(($up_bw/10))bit  ceil $(($up_bw/5))bit"
+
+}    
+tc_set(){
+
+	tc_set_wan; ## set wan egress config
+
+	local classid=2
+	for i in $DOWN_CFG; do
+		local cfg=`eval echo $i`
+		tc_set_down_iface $cfg $classid
+		classid=$(($classid+1));
+	done
+}
+sqm_stop(){
+	tc_main_clean;
+	ipt_clean;
+}
+
+sqm_start(){
+	if [ ! -e $RUNDIR ];then
+		mkdir -p $RUNDIR
+	fi
+	sqm_stop;
+	sqm_log "sqm start -------------------------------"
+	ipt_set;
+	tc_set;
+}
+
+#################################################main##################################
+mv $LOG /tmp/port_fc.log-bak
+
+if [ "$ACTION" = "stop"  ]; then
+    	sqm_stop;
+	exit 0
+else
+	sqm_start;
+fi
+
+
